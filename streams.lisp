@@ -35,6 +35,14 @@
     :initform nil
     :initarg :deadline
     :accessor ssl-stream-deadline)
+   (read-timeout
+    :initform nil
+    :initarg :read-timeout
+    :accessor ssl-stream-read-timeout)
+   (write-timeout
+    :initform nil
+    :initarg :write-timeout
+    :accessor ssl-stream-write-timeout)
    (output-buffer
     :initform (make-buffer +initial-buffer-size+)
     :accessor ssl-stream-output-buffer)
@@ -263,7 +271,7 @@ may be associated with the passphrase PASSWORD."
 ;; fixme: free the context when errors happen in this function
 (defun make-ssl-server-stream
     (socket &key certificate key password (method 'ssl-v23-method) external-format
-                 close-callback (unwrap-stream-p t))
+                 close-callback (unwrap-stream-p t) read-timeout write-timeout)
   "Returns an SSL stream for the server socket descriptor SOCKET.
 CERTIFICATE is the path to a file containing the PEM-encoded certificate for
  your server. KEY is the path to the PEM-encoded key for the server, which
@@ -273,7 +281,9 @@ may be associated with the passphrase PASSWORD."
 		 :socket socket
 		 :close-callback close-callback
 		 :certificate certificate
-		 :key key))
+		 :key key
+		 :read-timeout read-timeout
+		 :write-timeout write-timeout))
         (handle (ssl-new *ssl-global-context*)))
     (setf socket (install-handle-and-bio stream handle socket unwrap-stream-p))
     (ssl-set-accept-state handle)
@@ -283,7 +293,7 @@ may be associated with the passphrase PASSWORD."
       (install-key-and-cert handle key certificate))
     (ensure-ssl-funcall stream handle #'ssl-accept handle)
     (handle-external-format stream external-format)))
-
+    
 #+openmcl
 (defmethod stream-deadline ((stream ccl::basic-stream))
   (ccl::ioblock-deadline (ccl::stream-ioblock stream t)))
