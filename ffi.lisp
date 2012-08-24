@@ -24,7 +24,6 @@
 (defun ssl-initialized-p ()
   (and *ssl-global-context* *ssl-global-method*))
 
-
 ;;; Constants
 ;;;
 (defconstant +ssl-filetype-pem+ 1)
@@ -34,7 +33,15 @@
 (defconstant +SSL_CTRL_SET_SESS_CACHE_MODE+ 44)
 (defconstant +SSL_CTRL_MODE+ 33)
 
+(defconstant +SSL_CTRL_NEED_TMP_RSA+ 1)
+(defconstant +SSL_CTRL_SET_TMP_RSA+ 2)
+
+(defconstant +RSA_F4+ #x10001)
+
 (defconstant +SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER+ 2)
+
+(defvar *tmp-rsa-key-512* nil)
+(defvar *tmp-rsa-key-1024* nil)
 
 ;;; Misc
 ;;;
@@ -218,6 +225,44 @@
   (buf :pointer)
   (num :int))
 
+;;RSA *RSA_generate_key(int num, unsigned long e,
+;;    void (*callback)(int,int,void *), void *cb_arg);
+(cffi:defcfun ("RSA_generate_key" rsa-generate-key)
+    :pointer
+  (num :int)
+  (e :unsigned-long) 
+  (callback :pointer)
+  (opt :pointer))
+
+;;void RSA_free(RSA *rsa);
+;;
+(cffi:defcfun ("RSA_free" rsa-free)
+    :void
+  (rsa :pointer))
+
+;void SSL_CTX_set_tmp_rsa_callback(SSL_CTX *ctx,
+;            RSA *(*tmp_rsa_callback)(SSL *ssl, int is_export, int keylength));
+(cffi:defcfun ("SSL_CTX_set_tmp_rsa_callback" ssl-ctx-set-tmp-rsa-callback)
+    :pointer
+  (ctx :pointer)
+  (callback :pointer))
+
+;static RSA MS_CALLBACK *tmp_rsa_cb(SSL *s, int is_export, int keylength)
+
+(cffi:defcallback need-tmp-rsa-callback :pointer ((ssl :pointer) (export-p :int) (key-length :int))
+  (declare (ignore ssl export-p))
+					;
+					;blindly assume 512 bit key is needed
+					;
+  (cond ((= key-length 512)
+	 (progn
+	   (unless *tmp-rsa-key-512* (setf *tmp-rsa-key-512* (rsa-generate-key 512 +RSA_F4+ (cffi:null-pointer) (cffi:null-pointer))))
+		      *tmp-rsa-key-512*)
+	 t
+	 (progn
+	   (unless *tmp-rsa-key-1024* (setf *tmp-rsa-key-1024* (rsa-generate-key 1024 +RSA_F4+ (cffi:null-pointer) (cffi:null-pointer))))
+	   *tmp-rsa-key-1024*))))
+
 ;;; Funcall wrapper
 ;;;
 (defvar *socket*)
@@ -235,11 +280,13 @@
 	   (#.+ssl-error-want-read+
 	    (input-wait stream
 			(ssl-get-fd handle)
-			(ssl-stream-deadline stream)))
+			(ssl-stream-deadline stream) 
+			(ssl-stream-read-timeout stream)))
 	   (#.+ssl-error-want-write+
 	    (output-wait stream
 			 (ssl-get-fd handle)
-			 (ssl-stream-deadline stream)))
+			 (ssl-stream-deadline stream)
+			 (ssl-stream-write-timeout stream)))
 	   (t
 	    (ssl-signal-error handle func error nbytes)))))))
 
@@ -285,15 +332,25 @@
 	    (ccl::stream-io-error stream (- error) "write"))))))
 
 #+sbcl
-(defun output-wait (stream fd deadline)
+(define-condition ssl-timeout (error) 
+  ()
+  (:report (lambda(err stream) (declare (ignore err))(format stream "ssl timeout error"))))
+
+(defun output-wait (stream fd deadline &optional write-timeout)
   (declare (ignore stream))
   (let ((timeout
 	 ;; *deadline* is handled by wait-until-fd-usable automatically,
 	 ;; but we need to turn a user-specified deadline into a timeout
-	 (when deadline
-	   (/ (- deadline (get-internal-real-time))
-	      internal-time-units-per-second))))
-    (sb-sys:wait-until-fd-usable fd :output timeout)))
+	 ;;
+	 ;; if deadline is nil then timeout in seconds is considered
+	 ;;
+	 (if deadline
+	     (/ (- deadline (get-internal-real-time))
+		internal-time-units-per-second)
+	     write-timeout)))
+
+    (unless (sb-sys:wait-until-fd-usable fd :output timeout)
+      (error (make-condition 'ssl-timeout)))))
 
 #-(or clozure-common-lisp sbcl)
 (defun output-wait (stream fd deadline)
@@ -321,15 +378,20 @@
 	    (ccl::stream-io-error stream (- error) "read"))))))
 
 #+sbcl
-(defun input-wait (stream fd deadline)
+(defun input-wait (stream fd deadline &optional read-timeout)
   (declare (ignore stream))
   (let ((timeout
+	 ;;
+	 ;; if deadline is nil, then write-timeout is looked to as the timeout which could also be nil
+	 ;;
 	 ;; *deadline* is handled by wait-until-fd-usable automatically,
 	 ;; but we need to turn a user-specified deadline into a timeout
-	 (when deadline
-	   (/ (- deadline (get-internal-real-time))
-	      internal-time-units-per-second))))
-    (sb-sys:wait-until-fd-usable fd :input timeout)))
+	 (if deadline
+	     (/ (- deadline (get-internal-real-time))
+		internal-time-units-per-second)
+	     read-timeout)))
+    (unless (sb-sys:wait-until-fd-usable fd :input timeout)
+      (error (make-condition 'ssl-timeout))))) 
 
 #-(or clozure-common-lisp sbcl)
 (defun input-wait (stream fd deadline)
@@ -439,7 +501,8 @@ will use this value.")
   (setf *ssl-global-context* (ssl-ctx-new *ssl-global-method*))
   (ssl-ctx-set-session-cache-mode *ssl-global-context* 3)
   (ssl-ctx-set-default-passwd-cb *ssl-global-context* 
-                                 (cffi:callback pem-password-callback)))
+                                 (cffi:callback pem-password-callback))
+  (ssl-ctx-set-tmp-rsa-callback *ssl-global-context* (cffi:callback need-tmp-rsa-callback)))
 
 (defun ensure-initialized (&key (method 'ssl-v23-method) (rand-seed nil))
   "In most cases you do *not* need to call this function, because it 
@@ -478,4 +541,6 @@ context and in particular the loaded certificate chain."
   (cffi:load-foreign-library 'libssl)
   (cffi:load-foreign-library 'libeay32)
   (setf *ssl-global-context* nil)
-  (setf *ssl-global-method* nil))
+  (setf *ssl-global-method* nil)
+  (setf *tmp-rsa-key-512* nil)
+  (setf *tmp-rsa-key-1024* nil))
